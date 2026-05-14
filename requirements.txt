@@ -6,3 +6,5 @@ python-dotenv
 python-jose[cryptography]
 passlib[bcrypt]
 python-multipart
+boto3
+httpx

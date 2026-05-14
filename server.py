@@ -1,87 +1,143 @@
 """
-Meraki AI Assistant — FastAPI Backend with JWT Auth
-Secrets loaded from .env file for local development.
+Meraki AI Assistant — FastAPI Backend
+- AWS Cognito Hosted UI for authentication (Google, Microsoft, Email+Password)
+- JWT token verification using Cognito public keys (JWKS)
+- Per-user API keys stored in AWS SSM Parameter Store
+- HTTP-only session cookie (expires on browser close)
 
-Setup:
-1. Copy .env.example to .env and fill in your values
-2. To hash a password for .env, run:
-   python3 -c "from passlib.context import CryptContext; print(CryptContext(schemes=['bcrypt']).hash('yourpassword'))"
+Required .env values:
+    COGNITO_USER_POOL_ID
+    COGNITO_CLIENT_ID
+    COGNITO_CLIENT_SECRET
+    COGNITO_DOMAIN
+    COGNITO_REGION
+    APP_URL
+    AWS_REGION
+    SSM_PREFIX
 """
 
 import json
 import logging
 import os
-from datetime import datetime, timedelta
+from functools import lru_cache
 from typing import List, Optional
 
+import boto3
+import httpx
 import requests
 import anthropic
+from botocore.exceptions import ClientError
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 from pydantic import BaseModel
 
 load_dotenv()
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("meraki-assistant")
 
 # ---------------------------------------------------------------------------
-# Config from .env
+# Cognito config
 # ---------------------------------------------------------------------------
-JWT_SECRET       = os.getenv("JWT_SECRET", "change-me-in-production")
-JWT_ALGORITHM    = "HS256"
-JWT_EXPIRE_MINS  = int(os.getenv("JWT_EXPIRE_MINS", "480"))  # 8 hours
+COGNITO_REGION        = os.getenv("COGNITO_REGION", "ap-southeast-2")
+COGNITO_USER_POOL_ID  = os.getenv("COGNITO_USER_POOL_ID", "")
+COGNITO_CLIENT_ID     = os.getenv("COGNITO_CLIENT_ID", "")
+COGNITO_CLIENT_SECRET = os.getenv("COGNITO_CLIENT_SECRET", "")
+COGNITO_DOMAIN        = os.getenv("COGNITO_DOMAIN", "")  # e.g. meraki-assistant.auth.ap-southeast-2.amazoncognito.com
+APP_URL               = os.getenv("APP_URL", "http://localhost:8000")
 
-ANTHROPIC_KEY    = os.getenv("ANTHROPIC_API_KEY", "")
-MERAKI_KEY       = os.getenv("MERAKI_API_KEY", "")
-MERAKI_URL       = os.getenv("MERAKI_BASE_URL", "https://api.meraki.com/api/v1")
-CLAUDE_MODEL     = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
-
-# Users stored as JSON in .env: USERS_JSON={"admin":"$2b$12$hashed..."}
-USERS_DB: dict = json.loads(os.getenv("USERS_JSON", "{}"))
+COGNITO_ISSUER        = f"https://cognito-idp.{COGNITO_REGION}.amazonaws.com/{COGNITO_USER_POOL_ID}"
+COGNITO_JWKS_URL      = f"{COGNITO_ISSUER}/.well-known/jwks.json"
+COGNITO_TOKEN_URL     = f"https://{COGNITO_DOMAIN}/oauth2/token"
+COGNITO_LOGOUT_URL    = f"https://{COGNITO_DOMAIN}/logout"
+COGNITO_AUTH_URL      = f"https://{COGNITO_DOMAIN}/oauth2/authorize"
+REDIRECT_URI          = f"{APP_URL}/auth/callback"
 
 # ---------------------------------------------------------------------------
-# Auth helpers
+# SSM config
 # ---------------------------------------------------------------------------
-pwd_context   = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+AWS_REGION  = os.getenv("AWS_REGION", "ap-southeast-2")
+SSM_PREFIX  = os.getenv("SSM_PREFIX", "/meraki-assistant/users")
 
-def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+# ---------------------------------------------------------------------------
+# JWKS cache — fetch Cognito public keys once
+# ---------------------------------------------------------------------------
+@lru_cache(maxsize=1)
+def get_jwks():
+    resp = httpx.get(COGNITO_JWKS_URL)
+    resp.raise_for_status()
+    return resp.json()
 
-def authenticate_user(username: str, password: str) -> Optional[str]:
-    hashed = USERS_DB.get(username)
-    if not hashed or not verify_password(password, hashed):
-        return None
-    return username
-
-def create_token(username: str) -> str:
-    expire = datetime.utcnow() + timedelta(minutes=JWT_EXPIRE_MINS)
-    return jwt.encode({"sub": username, "exp": expire}, JWT_SECRET, algorithm=JWT_ALGORITHM)
-
-def get_current_user(token: str = Depends(oauth2_scheme)) -> str:
-    exc = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Invalid or expired session. Please log in again.",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
+# ---------------------------------------------------------------------------
+# Token verification
+# ---------------------------------------------------------------------------
+def verify_cognito_token(token: str) -> dict:
+    """Verify Cognito JWT token and return claims."""
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        username: str = payload.get("sub")
-        if not username or username not in USERS_DB:
-            raise exc
-        return username
-    except JWTError:
-        raise exc
+        jwks = get_jwks()
+        header = jwt.get_unverified_header(token)
+        key = next((k for k in jwks["keys"] if k["kid"] == header["kid"]), None)
+        if not key:
+            raise HTTPException(status_code=401, detail="Invalid token key")
+        claims = jwt.decode(
+            token,
+            key,
+            algorithms=["RS256"],
+            audience=COGNITO_CLIENT_ID,
+            issuer=COGNITO_ISSUER,
+        )
+        return claims
+    except JWTError as e:
+        raise HTTPException(status_code=401, detail=f"Token error: {str(e)}")
+
+def get_current_user(session_token: Optional[str] = Cookie(None)) -> dict:
+    """Extract and verify user from HTTP-only session cookie."""
+    if not session_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated"
+        )
+    return verify_cognito_token(session_token)
+
+# ---------------------------------------------------------------------------
+# SSM helpers
+# ---------------------------------------------------------------------------
+def ssm_client():
+    return boto3.client("ssm", region_name=AWS_REGION)
+
+def ssm_path(user_id: str, key: str) -> str:
+    return f"{SSM_PREFIX}/{user_id}/{key}"
+
+def ssm_get(user_id: str, key: str) -> Optional[str]:
+    try:
+        r = ssm_client().get_parameter(Name=ssm_path(user_id, key), WithDecryption=True)
+        return r["Parameter"]["Value"]
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ParameterNotFound":
+            return None
+        raise
+
+def ssm_put(user_id: str, key: str, value: str):
+    ssm_client().put_parameter(
+        Name=ssm_path(user_id, key),
+        Value=value,
+        Type="SecureString",
+        Overwrite=True,
+        Description=f"Meraki Assistant config for user: {user_id}"
+    )
+
+def load_user_config(user_id: str) -> dict:
+    keys = ["anthropic_key", "meraki_key", "meraki_url", "model"]
+    return {k: v for k in keys if (v := ssm_get(user_id, k))}
+
+def save_user_config(user_id: str, config: dict):
+    for k, v in config.items():
+        if k in ["anthropic_key", "meraki_key", "meraki_url", "model"] and v:
+            ssm_put(user_id, k, v)
 
 # ---------------------------------------------------------------------------
 # Meraki tools
@@ -96,25 +152,25 @@ TOOLS = [
     {"name": "get_uplink_statuses", "description": "Get WAN uplink health for MX appliances.",                              "input_schema": {"type": "object", "properties": {"org_id":     {"type": "string"}}, "required": ["org_id"]}},
 ]
 
-def meraki_get(path: str) -> dict:
+def meraki_get(path: str, meraki_key: str, meraki_url: str) -> dict:
     r = requests.get(
-        f"{MERAKI_URL}{path}",
-        headers={"X-Cisco-Meraki-API-Key": MERAKI_KEY, "Content-Type": "application/json"},
+        f"{meraki_url}{path}",
+        headers={"X-Cisco-Meraki-API-Key": meraki_key, "Content-Type": "application/json"},
         timeout=15
     )
     r.raise_for_status()
     return r.json()
 
-def run_tool(name: str, inputs: dict) -> dict:
+def run_tool(name: str, inputs: dict, meraki_key: str, meraki_url: str) -> dict:
     try:
         match name:
-            case "get_organizations":   return meraki_get("/organizations")
-            case "get_networks":        return meraki_get(f"/organizations/{inputs['org_id']}/networks")
-            case "get_devices":         return meraki_get(f"/networks/{inputs['network_id']}/devices")
-            case "get_clients":         return meraki_get(f"/networks/{inputs['network_id']}/clients?timespan=3600")
-            case "get_device_statuses": return meraki_get(f"/organizations/{inputs['org_id']}/devices/statuses")
-            case "get_network_events":  return meraki_get(f"/networks/{inputs['network_id']}/events?perPage=50")
-            case "get_uplink_statuses": return meraki_get(f"/organizations/{inputs['org_id']}/appliance/uplink/statuses")
+            case "get_organizations":   return meraki_get("/organizations", meraki_key, meraki_url)
+            case "get_networks":        return meraki_get(f"/organizations/{inputs['org_id']}/networks", meraki_key, meraki_url)
+            case "get_devices":         return meraki_get(f"/networks/{inputs['network_id']}/devices", meraki_key, meraki_url)
+            case "get_clients":         return meraki_get(f"/networks/{inputs['network_id']}/clients?timespan=3600", meraki_key, meraki_url)
+            case "get_device_statuses": return meraki_get(f"/organizations/{inputs['org_id']}/devices/statuses", meraki_key, meraki_url)
+            case "get_network_events":  return meraki_get(f"/networks/{inputs['network_id']}/events?perPage=50", meraki_key, meraki_url)
+            case "get_uplink_statuses": return meraki_get(f"/organizations/{inputs['org_id']}/appliance/uplink/statuses", meraki_key, meraki_url)
             case _:                     return {"error": f"Unknown tool: {name}"}
     except Exception as e:
         log.error(f"Tool {name} failed: {e}")
@@ -127,37 +183,135 @@ app = FastAPI(title="Meraki AI Assistant")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[APP_URL],
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_credentials=True,
 )
 
 # ---------------------------------------------------------------------------
 # Auth endpoints
 # ---------------------------------------------------------------------------
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str
-    username: str
+@app.get("/auth/login")
+async def login():
+    """Redirect user to Cognito Hosted UI."""
+    url = (
+        f"{COGNITO_AUTH_URL}"
+        f"?client_id={COGNITO_CLIENT_ID}"
+        f"&response_type=code"
+        f"&scope=openid%20email%20profile"
+        f"&redirect_uri={REDIRECT_URI}"
+    )
+    return RedirectResponse(url)
 
-@app.post("/auth/login", response_model=TokenResponse)
-async def login(form: OAuth2PasswordRequestForm = Depends()):
-    username = authenticate_user(form.username, form.password)
-    if not username:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
+@app.get("/auth/callback")
+async def auth_callback(code: str):
+    """Handle Cognito callback — exchange code for tokens and set cookie."""
+    # Exchange authorization code for tokens
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            COGNITO_TOKEN_URL,
+            data={
+                "grant_type":   "authorization_code",
+                "client_id":    COGNITO_CLIENT_ID,
+                "client_secret": COGNITO_CLIENT_SECRET,
+                "redirect_uri": REDIRECT_URI,
+                "code":         code,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
-    token = create_token(username)
-    log.info(f"User '{username}' logged in")
-    return {"access_token": token, "token_type": "bearer", "username": username}
+
+    if resp.status_code != 200:
+        log.error(f"Token exchange failed: {resp.text}")
+        raise HTTPException(status_code=400, detail="Authentication failed. Please try again.")
+
+    tokens = resp.json()
+    id_token = tokens.get("id_token")
+
+    if not id_token:
+        raise HTTPException(status_code=400, detail="No ID token received from Cognito.")
+
+    # Verify token is valid
+    claims = verify_cognito_token(id_token)
+    log.info(f"User logged in: {claims.get('email')}")
+
+    # Set HTTP-only cookie (no max_age = expires on browser close)
+    response = RedirectResponse(url="/chat-ui")
+    response.set_cookie(
+        key="session_token",
+        value=id_token,
+        httponly=True,       # JS cannot read this cookie
+        secure=False,        # Set to True in production (HTTPS)
+        samesite="lax",
+        max_age=None,        # Expires when browser closes
+    )
+    return response
+
+@app.get("/auth/logout")
+async def logout():
+    """Clear session cookie and redirect to Cognito logout."""
+    cognito_logout = (
+        f"{COGNITO_LOGOUT_URL}"
+        f"?client_id={COGNITO_CLIENT_ID}"
+        f"&logout_uri={APP_URL}"
+    )
+    response = RedirectResponse(url=cognito_logout)
+    response.delete_cookie("session_token")
+    return response
 
 @app.get("/auth/me")
-async def me(current_user: str = Depends(get_current_user)):
-    return {"username": current_user}
+async def me(current_user: dict = Depends(get_current_user)):
+    """Return current user info."""
+    return {
+        "username": current_user.get("email") or current_user.get("cognito:username"),
+        "email": current_user.get("email"),
+        "name": current_user.get("name"),
+        "user_id": current_user.get("sub"),  # Cognito unique user ID
+    }
 
 # ---------------------------------------------------------------------------
-# Chat endpoint — JWT protected
+# Config endpoints — load/save per-user keys from SSM
+# ---------------------------------------------------------------------------
+class UserConfig(BaseModel):
+    anthropic_key: Optional[str] = None
+    meraki_key: Optional[str] = None
+    meraki_url: Optional[str] = None
+    model: Optional[str] = None
+
+@app.get("/config")
+async def get_config(current_user: dict = Depends(get_current_user)):
+    """Load this user's API keys from SSM. Returns masked values."""
+    user_id = current_user.get("sub")
+    try:
+        cfg = load_user_config(user_id)
+        masked = {}
+        for k, v in cfg.items():
+            if k in ("anthropic_key", "meraki_key") and v:
+                masked[k] = "••••••••" + v[-4:]
+            else:
+                masked[k] = v
+        return {
+            "config": masked,
+            "configured": bool(cfg.get("anthropic_key") and cfg.get("meraki_key"))
+        }
+    except Exception as e:
+        log.error(f"Failed to load config for {user_id}: {e}")
+        raise HTTPException(status_code=500, detail="Could not load config from AWS SSM.")
+
+@app.post("/config")
+async def save_config(cfg: UserConfig, current_user: dict = Depends(get_current_user)):
+    """Save this user's API keys to SSM."""
+    user_id = current_user.get("sub")
+    try:
+        save_user_config(user_id, cfg.dict(exclude_none=True))
+        log.info(f"Config saved to SSM for user '{current_user.get('email')}'")
+        return {"message": "Configuration saved successfully."}
+    except Exception as e:
+        log.error(f"Failed to save config for {user_id}: {e}")
+        raise HTTPException(status_code=500, detail="Could not save config to AWS SSM.")
+
+# ---------------------------------------------------------------------------
+# Chat endpoint — cookie protected, keys from SSM
 # ---------------------------------------------------------------------------
 class Message(BaseModel):
     role: str
@@ -167,17 +321,25 @@ class ChatRequest(BaseModel):
     messages: List[Message]
 
 @app.post("/chat")
-async def chat(req: ChatRequest, current_user: str = Depends(get_current_user)):
-    if not ANTHROPIC_KEY or not MERAKI_KEY:
-        raise HTTPException(status_code=500, detail="Server API keys not configured. Check your .env file.")
+async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user)):
+    user_id = current_user.get("sub")
+    cfg = load_user_config(user_id)
 
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+    anthropic_key = cfg.get("anthropic_key")
+    meraki_key    = cfg.get("meraki_key")
+    meraki_url    = cfg.get("meraki_url") or "https://api.meraki.com/api/v1"
+    model         = cfg.get("model") or "claude-haiku-4-5-20251001"
+
+    if not anthropic_key or not meraki_key:
+        raise HTTPException(status_code=400, detail="API keys not configured. Open Settings to add them.")
+
+    client = anthropic.Anthropic(api_key=anthropic_key)
     messages = [{"role": m.role, "content": m.content} for m in req.messages]
     tool_calls_log = []
 
     while True:
         response = client.messages.create(
-            model=CLAUDE_MODEL,
+            model=model,
             max_tokens=1024,
             system=(
                 "You are a Meraki network assistant. Use tools to answer questions about the user's network. "
@@ -192,7 +354,7 @@ async def chat(req: ChatRequest, current_user: str = Depends(get_current_user)):
             for block in response.content:
                 if block.type == "tool_use":
                     tool_calls_log.append(block.name)
-                    result = run_tool(block.name, block.input)
+                    result = run_tool(block.name, block.input, meraki_key, meraki_url)
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
@@ -211,9 +373,23 @@ async def chat(req: ChatRequest, current_user: str = Depends(get_current_user)):
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/")
-async def root():
-    return FileResponse("static/login.html")
+async def root(session_token: Optional[str] = Cookie(None)):
+    """Root — redirect to chat if logged in, otherwise to Cognito login."""
+    if session_token:
+        try:
+            verify_cognito_token(session_token)
+            return RedirectResponse(url="/chat-ui")
+        except:
+            pass
+    return RedirectResponse(url="/auth/login")
 
 @app.get("/chat-ui")
-async def chat_ui():
-    return FileResponse("static/index.html")
+async def chat_ui(session_token: Optional[str] = Cookie(None)):
+    """Chat page — protected."""
+    if not session_token:
+        return RedirectResponse(url="/auth/login")
+    try:
+        verify_cognito_token(session_token)
+        return FileResponse("static/index.html")
+    except:
+        return RedirectResponse(url="/auth/login")
