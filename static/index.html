@@ -299,28 +299,14 @@
   const sendBtn = document.getElementById('send');
   let history   = [];
 
-  // --- Auth guard ---
-  const token    = localStorage.getItem('jwt_token');
-  const username = localStorage.getItem('username') || 'user';
+  // --- Auth handled by HTTP-only cookie (set by server) ---
+function logout() {
+  window.location.href = '/auth/logout';
+}
 
-  if (!token) {
-    window.location.href = '/';
-  } else {
-    document.getElementById('usernameDisplay').textContent = username;
-  }
-
-  function logout() {
-    localStorage.removeItem('jwt_token');
-    localStorage.removeItem('username');
-    window.location.href = '/';
-  }
-
-  function authHeaders() {
-    return {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${token}`
-    };
-  }
+function authHeaders() {
+  return { 'Content-Type': 'application/json' };
+}
 
   // --- Chat helpers ---
   function autoResize(el) {

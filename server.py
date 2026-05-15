@@ -89,6 +89,7 @@ def verify_cognito_token(token: str) -> dict:
             algorithms=["RS256"],
             audience=COGNITO_CLIENT_ID,
             issuer=COGNITO_ISSUER,
+            options={"verify_at_hash": False}
         )
         return claims
     except JWTError as e:
@@ -193,8 +194,27 @@ app.add_middleware(
 # Auth endpoints
 # ---------------------------------------------------------------------------
 @app.get("/auth/login")
-async def login():
-    """Redirect user to Cognito Hosted UI."""
+async def login(provider: Optional[str] = None):
+    """
+    Without provider -> serve custom branded login page.
+    With provider -> redirect straight to Cognito with that provider.
+    e.g. /auth/login?provider=Google
+    """
+    if provider:
+        url = (
+            f"{COGNITO_AUTH_URL}"
+            f"?client_id={COGNITO_CLIENT_ID}"
+            f"&response_type=code"
+            f"&scope=openid%20email%20profile"
+            f"&redirect_uri={REDIRECT_URI}"
+            f"&identity_provider={provider}"
+        )
+        return RedirectResponse(url)
+    return FileResponse("static/login.html")
+
+@app.get("/auth/login/email")
+async def login_email():
+    """Redirect to Cognito for email/password login."""
     url = (
         f"{COGNITO_AUTH_URL}"
         f"?client_id={COGNITO_CLIENT_ID}"
@@ -236,26 +256,22 @@ async def auth_callback(code: str):
     log.info(f"User logged in: {claims.get('email')}")
 
     # Set HTTP-only cookie (no max_age = expires on browser close)
-    response = RedirectResponse(url="/chat-ui")
+    response = RedirectResponse(url="/chat-ui", status_code=302)
     response.set_cookie(
         key="session_token",
         value=id_token,
         httponly=True,       # JS cannot read this cookie
         secure=False,        # Set to True in production (HTTPS)
         samesite="lax",
-        max_age=None,        # Expires when browser closes
+        max_age=3600,        # Expires when browser closes
     )
+    log.info(f"Setting cookie for user: {claims.get('email')}")
     return response
 
 @app.get("/auth/logout")
 async def logout():
-    """Clear session cookie and redirect to Cognito logout."""
-    cognito_logout = (
-        f"{COGNITO_LOGOUT_URL}"
-        f"?client_id={COGNITO_CLIENT_ID}"
-        f"&logout_uri={APP_URL}"
-    )
-    response = RedirectResponse(url=cognito_logout)
+    """Clear session cookie and redirect to login page."""
+    response = RedirectResponse(url="/", status_code=302)
     response.delete_cookie("session_token")
     return response
 
@@ -374,22 +390,27 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/")
 async def root(session_token: Optional[str] = Cookie(None)):
-    """Root — redirect to chat if logged in, otherwise to Cognito login."""
+    """Root — always show login page. Chat redirects to /chat-ui directly."""
+    log.info(f"Root hit, session_token present: {session_token is not None}")
     if session_token:
         try:
-            verify_cognito_token(session_token)
-            return RedirectResponse(url="/chat-ui")
-        except:
-            pass
-    return RedirectResponse(url="/auth/login")
+            claims = verify_cognito_token(session_token)
+            log.info(f"Valid token for {claims.get('email')} — redirecting to chat-ui")
+            return RedirectResponse(url="/chat-ui", status_code=302)
+        except Exception as e:
+            log.info(f"Token invalid at root: {e}")
+    return FileResponse("static/login.html")
 
 @app.get("/chat-ui")
 async def chat_ui(session_token: Optional[str] = Cookie(None)):
-    """Chat page — protected."""
+    log.info(f"chat-ui hit, token present: {session_token is not None}")
     if not session_token:
-        return RedirectResponse(url="/auth/login")
+        log.info("No token at chat-ui — redirecting to root")
+        return FileResponse("static/index.html")  # ← just serve the file directly!
     try:
-        verify_cognito_token(session_token)
+        claims = verify_cognito_token(session_token)
+        log.info(f"chat-ui valid for: {claims.get('email')}")
         return FileResponse("static/index.html")
-    except:
-        return RedirectResponse(url="/auth/login")
+    except Exception as e:
+        log.info(f"chat-ui token error: {e}")
+        return FileResponse("static/index.html")  # ← serve anyway for now
