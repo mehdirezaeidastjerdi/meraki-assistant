@@ -208,6 +208,7 @@ async def login(provider: Optional[str] = None):
             f"&scope=openid%20email%20profile"
             f"&redirect_uri={REDIRECT_URI}"
             f"&identity_provider={provider}"
+            f"&prompt=select_account"
         )
         return RedirectResponse(url)
     return FileResponse("static/login.html")
