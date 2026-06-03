@@ -391,27 +391,23 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/")
 async def root(session_token: Optional[str] = Cookie(None)):
-    """Root — always show login page. Chat redirects to /chat-ui directly."""
-    log.info(f"Root hit, session_token present: {session_token is not None}")
     if session_token:
         try:
-            claims = verify_cognito_token(session_token)
-            log.info(f"Valid token for {claims.get('email')} — redirecting to chat-ui")
+            verify_cognito_token(session_token)
             return RedirectResponse(url="/chat-ui", status_code=302)
-        except Exception as e:
-            log.info(f"Token invalid at root: {e}")
+        except:
+            pass
     return FileResponse("static/login.html")
 
 @app.get("/chat-ui")
 async def chat_ui(session_token: Optional[str] = Cookie(None)):
     log.info(f"chat-ui hit, token present: {session_token is not None}")
     if not session_token:
-        log.info("No token at chat-ui — redirecting to root")
-        return FileResponse("static/index.html")  # ← just serve the file directly!
+        return RedirectResponse(url="/", status_code=302)
     try:
         claims = verify_cognito_token(session_token)
         log.info(f"chat-ui valid for: {claims.get('email')}")
         return FileResponse("static/index.html")
     except Exception as e:
         log.info(f"chat-ui token error: {e}")
-        return FileResponse("static/index.html")  # ← serve anyway for now
+        return RedirectResponse(url="/", status_code=302)

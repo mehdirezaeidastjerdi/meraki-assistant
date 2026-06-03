@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: meraki-backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      # Mount source code for --reload to work
+      - ./server.py:/app/server.py
+      # Mount AWS credentials from your local machine
+      - ${HOME}/.aws:/root/.aws:ro
+    environment:
+      - AWS_DEFAULT_REGION=ap-southeast-2
+    networks:
+      - meraki-network
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: meraki-frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    networks:
+      - meraki-network
+
+networks:
+  meraki-network:
+    driver: bridge
