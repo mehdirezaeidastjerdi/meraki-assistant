@@ -85,7 +85,7 @@ jobs:
         run: |
           aws ecs wait services-stable \
             --cluster meraki-assistant-cluster \
-            --services meraki-assistant-service \
+            --services meraki-assistant-task-service-8udl3gbv \
             --region ap-southeast-2
 
       - name: Deployment summary
