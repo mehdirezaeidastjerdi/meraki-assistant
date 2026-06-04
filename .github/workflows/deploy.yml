@@ -77,7 +77,7 @@ jobs:
         run: |
           aws ecs update-service \
             --cluster meraki-assistant-cluster \
-            --service meraki-assistant-service \
+            --service meraki-assistant-task-service-8udl3gbv \
             --force-new-deployment \
             --region ap-southeast-2
 
