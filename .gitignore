@@ -1,8 +1,16 @@
 # Environment variables
 .env
+.env.*
+!.env.example
 
 # Virtual environment
 .venv/
+venv/
+env/
+
+# SSL certificates
+origin.pem
+origin.key
 
 # AWS notes
 static/AWS-notes.txt
@@ -12,5 +20,4 @@ __pycache__/
 *.pyc
 
 # VS Code
-.vscode/origin.pem
-origin.key
+.vscode/
