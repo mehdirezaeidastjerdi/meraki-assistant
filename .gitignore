@@ -12,4 +12,5 @@ __pycache__/
 *.pyc
 
 # VS Code
-.vscode/
+.vscode/origin.pem
+origin.key
