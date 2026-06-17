@@ -23,3 +23,4 @@ print('Certificates written successfully')
 
 echo "Starting Nginx..."
 exec nginx -g 'daemon off;'
+# testing again
