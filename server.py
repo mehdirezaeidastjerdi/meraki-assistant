@@ -1,3 +1,4 @@
+# v1.0.1 - deployment test
 """
 Meraki AI Assistant — FastAPI Backend
 - AWS Cognito Hosted UI for authentication (Google, Microsoft, Email+Password)
